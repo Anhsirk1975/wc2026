@@ -110,8 +110,14 @@ body{background:var(--bg);color:var(--text);
 .mc{background:var(--card);border:1px solid var(--b2);
   border-left:3px solid transparent;border-radius:11px;
   margin-bottom:9px;overflow:hidden;transition:transform .1s;}
-.mc.live{border-color:rgba(239,68,68,.4);
-  background:linear-gradient(135deg,rgba(239,68,68,.05),var(--card));}
+.mc.live{border-color:rgba(239,68,68,.5);
+  background:linear-gradient(135deg,rgba(239,68,68,.08),var(--card));
+  box-shadow:0 0 0 1px rgba(239,68,68,.25),0 4px 18px rgba(239,68,68,.18);
+  animation:liveglow 2.4s ease-in-out infinite;}
+@keyframes liveglow{
+  0%,100%{box-shadow:0 0 0 1px rgba(239,68,68,.25),0 4px 18px rgba(239,68,68,.12);}
+  50%{box-shadow:0 0 0 1px rgba(239,68,68,.45),0 4px 26px rgba(239,68,68,.32);}
+}
 .mc-meta{display:flex;align-items:center;justify-content:space-between;
   padding:10px 13px 7px;}
 .mc-grp{font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;}
@@ -438,7 +444,7 @@ body{background:var(--bg);color:var(--text);
 <div class="topbar">
   <div style="display:flex;align-items:center;gap:8px;">
     <span class="tb-brand">WC 2026</span>
-    <div class="livepill"><span class="ldot"></span>LIVE</div>
+    <div class="livepill" id="topLivePill" style="display:none;"><span class="ldot"></span><span id="topLiveTxt">LIVE</span></div>
   </div>
   <div style="display:flex;align-items:center;gap:6px;">
     <span id="istClock"></span>
@@ -595,7 +601,10 @@ var STATE = {
   lastFetch: null,
   hasLive: false,
   fetchError: null,
-  timer: null
+  failCount: 0,
+  timer: null,
+  apiDiag: null,      // {total, matched, samples} — for India tab diagnostics
+  keyPersisted: null  // null=unknown, true=saved to localStorage, false=session-only
 };
 
 /* ── GROUP COLOURS ── */
@@ -935,6 +944,69 @@ function showGoalToast(scorer, team, s1, s2, n1, n2, min) {
 }
 
 /* ══════════════════════════════════════════════════════
+   TEAM NAME RESOLUTION
+   football-data.org (and other feeds) use official FIFA names
+   that often differ from our short display names — e.g.
+   "Côte d'Ivoire" vs "Ivory Coast", "Korea Republic" vs
+   "South Korea", "United States" vs "USA", "Türkiye" vs
+   "Turkiye", "Cape Verde" vs "Cabo Verde", "Curaçao" with a
+   cedilla. A naive substring match silently fails for these,
+   meaning that match's live score NEVER updates. This builds
+   a normalized lookup table (accent-stripped, lowercased) that
+   maps every known alias back to our canonical FX team name.
+══════════════════════════════════════════════════════ */
+function normTeam(s) {
+  return String(s||'')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')   // strip accents (é→e, ç→c, ü→u)
+    .replace(/[^a-z0-9]+/g,' ')                          // punctuation -> space
+    .trim();
+}
+var TEAM_ALIASES = {
+  'South Korea':  ['Korea Republic','Republic of Korea','Korea South','KOR'],
+  'Czechia':      ['Czech Republic','CZE'],
+  'Switzerland':  ['Suisse','Schweiz','SUI'],
+  'Bosnia':       ['Bosnia and Herzegovina','Bosnia Herzegovina','BIH'],
+  'USA':          ['United States','United States of America','US'],
+  'Turkiye':      ['Turkey','TUR'],
+  'Ivory Coast':  ["Cote d'Ivoire",'Cote dIvoire','Cote d Ivoire','CIV'],
+  'Curacao':      ['Curaçao','CUW'],
+  'Cabo Verde':   ['Cape Verde','CPV'],
+  'Saudi Arabia': ['KSA','Saudi'],
+  'Iran':         ['IR Iran','Islamic Republic of Iran','IRN'],
+  'Congo DR':     ['DR Congo','Democratic Republic of the Congo','Democratic Republic of Congo','DRC','Congo DR','Congo, DR'],
+  'Netherlands':  ['Holland','NED'],
+  'England':      ['ENG'],
+  'Scotland':     ['SCO'],
+  'New Zealand':  ['NZL'],
+  'South Africa': ['RSA','ZAF'],
+  'Colombia':     ['COL'],
+  'Uzbekistan':   ['UZB'],
+  'Jordan':       ['JOR']
+};
+// Build reverse lookup: normalized alias -> our canonical FX team name
+var TEAM_NORM_MAP = {};
+(function buildTeamMap(){
+  var all = {};
+  FX.forEach(function(f){ all[f.t1]=1; all[f.t2]=1; });
+  Object.keys(all).forEach(function(t){
+    TEAM_NORM_MAP[normTeam(t)] = t;
+    (TEAM_ALIASES[t]||[]).forEach(function(a){ TEAM_NORM_MAP[normTeam(a)] = t; });
+  });
+})();
+// Resolve any external team name/shortName/code to our canonical FX name (or null)
+function resolveTeam(name) {
+  if (!name) return null;
+  return TEAM_NORM_MAP[normTeam(name)] || null;
+}
+// Find the FX fixture matching two resolved team names (order-independent fallback)
+function findFixtureByTeams(ourHome, ourAway) {
+  if (!ourHome || !ourAway) return null;
+  return FX.find(function(f){ return f.t1===ourHome && f.t2===ourAway; })
+      || FX.find(function(f){ return f.t1===ourAway && f.t2===ourHome; }) || null;
+}
+
+/* ══════════════════════════════════════════════════════
    LIVE DATA ENGINE
 ══════════════════════════════════════════════════════ */
 var LiveEngine = {
@@ -956,14 +1028,15 @@ var LiveEngine = {
   },
 
   parseAPI: function(list) {
-    var n=0;
-    list.forEach(function(am) {
-      var hn=(am.homeTeam&&am.homeTeam.name||'').toLowerCase();
-      var an=(am.awayTeam&&am.awayTeam.name||'').toLowerCase();
-      var fx=FX.find(function(f) {
-        var f1=f.t1.toLowerCase(), f2=f.t2.toLowerCase();
-        return (hn.includes(f1.split(' ')[0])||f1.includes(hn.split(' ')[0]))
-            && (an.includes(f2.split(' ')[0])||f2.includes(an.split(' ')[0]));
+    var n=0, samples=[];
+    list.forEach(function(am, idx) {
+      var ht = am.homeTeam||{}, at = am.awayTeam||{};
+      var ourHome = resolveTeam(ht.name) || resolveTeam(ht.shortName) || resolveTeam(ht.tla);
+      var ourAway = resolveTeam(at.name) || resolveTeam(at.shortName) || resolveTeam(at.tla);
+      var fx = findFixtureByTeams(ourHome, ourAway);
+      if (idx < 5) samples.push({
+        apiHome: ht.name||'?', apiAway: at.name||'?', status: am.status,
+        resolved: !!fx, ourHome: ourHome, ourAway: ourAway
       });
       if (!fx) return;
       var sc=am.score||{}, ft=sc.fullTime||{};
@@ -972,16 +1045,19 @@ var LiveEngine = {
       else if(st==='IN_PLAY')st='LIVE';
       else if(st==='PAUSED')st='HT';
       var s1=parseInt(ft.home)||0, s2=parseInt(ft.away)||0;
+      // If API's home/away order is flipped vs our fixture order, swap scores too
+      if (ourHome === fx.t2 && ourAway === fx.t1) { var tmp=s1; s1=s2; s2=tmp; }
       var goals=(am.goals||[]).map(function(g){ return {t:(g.team&&g.team.name)||'',n:(g.scorer&&g.scorer.name)||'?',m:g.minute||0}; });
       var prev=STATE.matches[fx.m];
-      if(prev && st==='LIVE' && (s1+s2)>(prev.s1+prev.s2) && goals.length) {
+      if(prev && st==='LIVE' && (s1+s2)>((prev.s1||0)+(prev.s2||0)) && goals.length) {
         var lat=goals[goals.length-1];
-        var ih=lat.t.toLowerCase().includes(fx.t1.toLowerCase().split(' ')[0]);
+        var ih=resolveTeam(lat.t)===fx.t1;
         showGoalToast(lat.n, lat.t, ih?s1:s2, ih?s2:s1, fx.t1, fx.t2, lat.m);
       }
       STATE.matches[fx.m]={s1:s1,s2:s2,status:st,goals:goals,minute:am.minute||null};
       n++;
     });
+    STATE.apiDiag = {total: list.length, matched: n, samples: samples, ts: new Date()};
     return n;
   },
 
@@ -994,14 +1070,13 @@ var LiveEngine = {
     var n=0;
     (data.matches||[]).forEach(function(m) {
       if(!m.score||!m.score.ft)return;
-      var n1=(m.team1&&m.team1.name||'').toLowerCase();
-      var n2=(m.team2&&m.team2.name||'').toLowerCase();
-      var fx=FX.find(function(f){
-        return (f.t1.toLowerCase().includes(n1.split(' ')[0])||n1.includes(f.t1.toLowerCase().split(' ')[0]))
-            && (f.t2.toLowerCase().includes(n2.split(' ')[0])||n2.includes(f.t2.toLowerCase().split(' ')[0]));
-      });
+      var ourHome = resolveTeam(m.team1&&m.team1.name) || resolveTeam(m.team1&&m.team1.code);
+      var ourAway = resolveTeam(m.team2&&m.team2.name) || resolveTeam(m.team2&&m.team2.code);
+      var fx = findFixtureByTeams(ourHome, ourAway);
       if(!fx)return;
-      STATE.matches[fx.m]={s1:m.score.ft[0],s2:m.score.ft[1],status:'FT',goals:[],minute:null};
+      var s1=m.score.ft[0], s2=m.score.ft[1];
+      if (ourHome === fx.t2 && ourAway === fx.t1) { var tmp=s1; s1=s2; s2=tmp; }
+      STATE.matches[fx.m]={s1:s1,s2:s2,status:'FT',goals:[],minute:null};
       n++;
     });
     return n;
@@ -1042,11 +1117,13 @@ var LiveEngine = {
         var n = LiveEngine.parseAPI(await LiveEngine.fetchAPI());
         STATE.source = 'api';
         STATE.failCount = 0;
+        STATE.fetchError = null;
         if (dot) dot.style.background = 'var(--green)';
         if (txt) txt.textContent = '✅ Live · football-data.org · ' + n + ' matches loaded';
         ok = true;
       } catch(e) {
         STATE.failCount = (STATE.failCount||0) + 1;
+        STATE.fetchError = e.message;
         // Only log on first failure — don't spam console
         if (STATE.failCount === 1) console.info('[WC2026] API unavailable:', e.message);
       }
@@ -1058,11 +1135,13 @@ var LiveEngine = {
         var n2 = LiveEngine.parseCDN(await LiveEngine.fetchCDN());
         STATE.source = 'cdn';
         STATE.failCount = 0;
+        if (!CFG.apiKey) STATE.fetchError = null;
         if (dot) dot.style.background = 'var(--amber)';
         if (txt) txt.textContent = '📡 CDN data · ' + n2 + ' results · updates ~daily';
         ok = true;
       } catch(e2) {
         STATE.failCount = (STATE.failCount||0) + 1;
+        if (!CFG.apiKey) STATE.fetchError = e2.message;
         // Log once only — no repeated spam
         if (STATE.failCount <= 2) console.info('[WC2026] CDN unavailable — will retry later');
       }
@@ -1089,17 +1168,34 @@ var LiveEngine = {
   },
 
   updateUI: function() {
-    STATE.hasLive = Object.values(STATE.matches).some(function(m){
+    var liveMatches = Object.values(STATE.matches).filter(function(m){
       return m.status==='LIVE'||m.status==='HT';
     });
+    STATE.hasLive = liveMatches.length > 0;
     var lb = document.getElementById('liveBadge');
     if (lb) lb.style.display = STATE.hasLive ? 'block' : 'none';
+    // Topbar pill: only show when a match is actually live right now
+    var pill = document.getElementById('topLivePill');
+    var pillTxt = document.getElementById('topLiveTxt');
+    if (pill) {
+      if (STATE.hasLive) {
+        pill.style.display = 'flex';
+        if (pillTxt) pillTxt.textContent = liveMatches.length + ' LIVE';
+        pill.onclick = function(){ goPage('home'); };
+        pill.style.cursor = 'pointer';
+      } else {
+        pill.style.display = 'none';
+      }
+    }
     var cp = document.querySelector('.page.active');
     if (cp) {
       var pid = cp.id.replace('page-','');
       if (pid==='home') renderHome();
       else if (pid==='fixtures') renderFixtures();
       else if (pid==='live') renderStandings();
+      // India tab is intentionally NOT auto-re-rendered here — re-rendering
+      // mid-refresh would wipe out an API key the user is currently typing.
+      // It re-renders fresh every time the tab is opened (goPage -> renderIndia).
     }
   },
 
@@ -1660,13 +1756,13 @@ function buildGroupsGuide() {
    INDIA HUB
 ══════════════════════════════════════════════════════ */
 function renderIndia() {
-  var w=document.getElementById('indiaWrap'); if(!w||w.dataset.r)return;
-  w.dataset.r='1';
+  var w=document.getElementById('indiaWrap'); if(!w)return;
   var primeCnt=FX.filter(function(f){ return isPrime(f.est); }).length;
   var lateCnt =FX.filter(function(f){ var h=toIST(f.est).h; return !toIST(f.est).next&&h>=23; }).length;
   var deepCnt =FX.filter(function(f){ var i=toIST(f.est); return i.next&&i.h<6; }).length;
   w.innerHTML=`
     ${buildAPISetup()}
+    ${buildDiagnostics()}
     <div class="alert-card" style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);border-left:3px solid var(--red);">
       <div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:800;color:var(--red);margin-bottom:4px;">😴 87% of Matches Are Late Night IST</div>
       <div style="font-size:11px;color:#aaa;line-height:1.6;">Most matches kick off <strong style="color:var(--gold)">11 PM – 4:30 AM IST</strong>.
@@ -1744,23 +1840,34 @@ function renderIndia() {
       </div>
     </div>`;
 }
+function maskKey(k) {
+  if (!k) return '';
+  if (k.length <= 8) return k.slice(0,2)+'••••';
+  return k.slice(0,4) + '••••••' + k.slice(-4);
+}
+
 function buildAPISetup() {
-  if(CFG.apiKey) return `
+  if(CFG.apiKey) {
+    var persistNote = STATE.keyPersisted === false
+      ? `<div style="font-size:10px;color:var(--amber);margin-top:4px;">⚠️ Saved for this session only — your browser blocked persistent storage (private/incognito mode?). You may need to re-enter the key after closing the tab.</div>`
+      : `<div style="font-size:10px;color:var(--muted);margin-top:2px;">Key: <code style="color:var(--gold);">${maskKey(CFG.apiKey)}</code> · Saved in this browser</div>`;
+    return `
     <div style="background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);
       border-radius:10px;padding:12px 14px;margin-bottom:10px;
       display:flex;align-items:center;justify-content:space-between;gap:10px;">
       <div>
-        <div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:800;color:var(--green);">✅ Live API Connected</div>
-        <div style="font-size:10px;color:var(--muted);margin-top:2px;">football-data.org · Scores refresh every 30–60 seconds</div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:800;color:var(--green);">✅ API Key Configured</div>
+        ${persistNote}
       </div>
       <button onclick="removeAPIKey()" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);
-        color:#ef4444;border-radius:6px;padding:6px 10px;font-size:10px;cursor:pointer;">Remove</button>
+        color:#ef4444;border-radius:6px;padding:6px 10px;font-size:10px;cursor:pointer;flex-shrink:0;">Remove</button>
     </div>`;
+  }
   return `<div class="setup-box">
     <div style="font-family:'Barlow Condensed',sans-serif;font-size:15px;font-weight:800;color:var(--gold);margin-bottom:4px;">🔑 Enable Live Scores — Free API Key</div>
     <div style="font-size:11px;color:var(--muted);line-height:1.7;margin-bottom:8px;">
       <strong style="color:var(--text);">football-data.org</strong> gives a free API key (just email signup).
-      Once added, scores update every 30 seconds during live matches.
+      Once added, the app checks for live scores automatically.
     </div>
     <div class="setup-steps">
       1️⃣ Open <strong style="color:var(--gold);">football-data.org</strong> in your browser<br>
@@ -1771,24 +1878,112 @@ function buildAPISetup() {
     <input class="setup-inp" id="apiKeyInput" type="text" placeholder="Paste your API key here…">
     <button class="btn-gold" onclick="saveAPIKey()">💾 Save and Enable Live Scores</button>
     <div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6;">
-      Without a key: app uses openfootball data (~daily updates) + baked results for first 3 matches.
+      Without a key: app uses openfootball data (~daily updates) + baked results for early matches.
     </div>
   </div>`;
 }
+
+/* Diagnostics card — always shows current connection state so the user
+   can self-diagnose "API connected but scores not updating" issues.
+   This re-renders fresh every time the India tab is opened. */
+function buildDiagnostics() {
+  var sourceLabel = {
+    api:   '✅ football-data.org (live)',
+    cdn:   '📡 openfootball CDN (daily)',
+    baked: '📦 Cached / baked-in data'
+  }[STATE.source] || STATE.source;
+
+  var lastFetchTxt = '—';
+  if (STATE.lastFetch) {
+    var ist = new Date(STATE.lastFetch.getTime() + 5.5*3600000);
+    var h=ist.getUTCHours(), m=ist.getUTCMinutes();
+    var ap=h<12?'AM':'PM', dh=h%12||12;
+    lastFetchTxt = dh+':'+(m<10?'0':'')+m+' '+ap+' IST';
+  }
+
+  var liveCount = Object.values(STATE.matches).filter(function(mt){return mt.status==='LIVE'||mt.status==='HT';}).length;
+
+  var apiRows = '';
+  if (CFG.apiKey) {
+    if (STATE.apiDiag) {
+      var d = STATE.apiDiag;
+      var matchRate = d.total>0 ? Math.round(d.matched/d.total*100) : 0;
+      apiRows += `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--b2);">
+        <span style="font-size:11px;color:var(--muted);">API matches recognised</span>
+        <span style="font-size:12px;font-weight:700;color:${d.matched>0?'var(--green)':'var(--red)'};">${d.matched} / ${d.total} (${matchRate}%)</span>
+      </div>`;
+      if (d.matched === 0 && d.total > 0) {
+        apiRows += `<div style="font-size:10px;color:var(--amber);padding:6px 0;line-height:1.6;">
+          ⚠️ API responded but 0 fixtures matched. Sample team names from API:<br>
+          ${d.samples.map(function(s){return `<code style="color:var(--gold);">${s.apiHome}</code> vs <code style="color:var(--gold);">${s.apiAway}</code> (${s.status})`;}).join('<br>')}
+          <br>If these look unfamiliar, the World Cup competition may not be active in the API yet — this is normal before/just after the draw, retry later.
+        </div>`;
+      }
+    } else if (STATE.fetchError) {
+      apiRows += `<div style="font-size:10px;color:var(--red);padding:6px 0;line-height:1.6;">
+        ❌ Last API error: <code>${STATE.fetchError}</code><br>
+        ${STATE.fetchError.indexOf('HTTP 403')!==-1 ? 'Your API key may not have access to the World Cup competition on the free tier yet, or the key is invalid.' : ''}
+        ${STATE.fetchError.indexOf('HTTP 429')!==-1 ? 'Rate limit hit (10 requests/minute on free tier) — will retry automatically.' : ''}
+      </div>`;
+    } else {
+      apiRows += `<div style="font-size:10px;color:var(--muted);padding:6px 0;">No API call made yet — tap "Test Connection Now" below.</div>`;
+    }
+  }
+
+  return `<div class="icard" style="border-color:rgba(255,215,0,.15);">
+    <div class="icard-title">🔍 Live Data Diagnostics</div>
+    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--b2);">
+      <span style="font-size:11px;color:var(--muted);">Current data source</span>
+      <span style="font-size:12px;font-weight:700;">${sourceLabel}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--b2);">
+      <span style="font-size:11px;color:var(--muted);">Last updated</span>
+      <span style="font-size:12px;font-weight:700;color:var(--gold);">${lastFetchTxt}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--b2);">
+      <span style="font-size:11px;color:var(--muted);">Live matches right now</span>
+      <span style="font-size:12px;font-weight:700;color:${liveCount>0?'var(--red)':'var(--muted)'};">${liveCount>0 ? '🔴 '+liveCount+' LIVE' : 'None'}</span>
+    </div>
+    ${apiRows}
+    <div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6;">
+      ℹ️ football-data.org's <strong>free tier</strong> may delay live scores by a few minutes (it is not instant). For true real-time, a paid tier is required — the app will still show the result as soon as it's available.
+    </div>
+    <button class="btn-gold" style="margin-top:10px;" onclick="testConnection()">🔄 Test Connection Now</button>
+  </div>`;
+}
+
+function testConnection() {
+  showToast('Testing connection…');
+  LiveEngine.refresh(true).then(function(){
+    var w=document.getElementById('indiaWrap');
+    if (w) renderIndia();
+    showToast('✅ Diagnostics updated');
+  });
+}
+
 function saveAPIKey() {
   var inp=document.getElementById('apiKeyInput'); if(!inp)return;
   var key=inp.value.trim();
   if(!key){ showToast('Please paste your API key first'); return; }
   CFG.apiKey=key;
-  try{ localStorage.setItem('wc26_apikey',key); }catch(e){}
-  var w=document.getElementById('indiaWrap'); if(w){ w.dataset.r=''; renderIndia(); }
-  showToast('✅ API key saved! Fetching live data…');
-  LiveEngine.refresh(true);
+  // Verify the browser actually persisted it (fails in some private/incognito modes)
+  try{
+    localStorage.setItem('wc26_apikey',key);
+    STATE.keyPersisted = (localStorage.getItem('wc26_apikey') === key);
+  }catch(e){
+    STATE.keyPersisted = false;
+  }
+  renderIndia();
+  showToast(STATE.keyPersisted===false
+    ? '⚠️ Key set for this session — browser blocked saving'
+    : '✅ API key saved! Testing connection…');
+  LiveEngine.refresh(true).then(function(){ renderIndia(); });
 }
 function removeAPIKey() {
   CFG.apiKey='';
+  STATE.apiDiag=null; STATE.fetchError=null; STATE.keyPersisted=null;
   try{ localStorage.removeItem('wc26_apikey'); }catch(e){}
-  var w=document.getElementById('indiaWrap'); if(w){ w.dataset.r=''; renderIndia(); }
+  renderIndia();
   showToast('API key removed');
 }
 

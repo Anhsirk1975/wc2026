@@ -853,17 +853,48 @@ function toIST(est) {
 }
 function isPrime(est) { var h = toIST(est).h; return !toIST(est).next && h>=18 && h<23; }
 function todayStr() {
-  var d=new Date();
+  // Returns today's date in IST (India is UTC+5:30)
+  var now = new Date(Date.now() + 5.5*3600000);
   var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return (d.getDate()<10?'0':'')+d.getDate()+'-'+mo[d.getMonth()];
+  return (now.getUTCDate()<10?'0':'')+now.getUTCDate()+'-'+mo[now.getUTCMonth()];
 }
+
+/* ── Generic IST date helpers ──────────────────────────────────────────
+   A match listed as "13-Jun 18:00 EDT" actually kicks off at 03:30 IST
+   on 14-Jun (EDT + 9h30m crosses midnight). These helpers take a raw
+   "DD-Mon" date string + an "HH:MM" EDT time string and return the
+   CORRECT IST calendar date / day-name for display. Used by both the
+   group-stage fixture list (FX) and the knockout bracket (KO_ROUNDS),
+   which use different field names (.d vs .date) for the same purpose. */
+var MO_IDX = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+var MO_NM  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+var DAY_NM = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+function istDateObj(dateStr, est) {
+  var i = toIST(est);
+  var pt = dateStr.split('-');
+  var d = new Date(2026, MO_IDX[pt[1]] !== undefined ? MO_IDX[pt[1]] : 5, parseInt(pt[0]));
+  if (i.next) d.setDate(d.getDate() + 1); // JS Date correctly rolls over month/year
+  return d;
+}
+function shiftDateStr(dateStr, est) {
+  var d = istDateObj(dateStr, est);
+  return (d.getDate()<10?'0':'') + d.getDate() + '-' + MO_NM[d.getMonth()];
+}
+function dayNameForDate(dateStr) {
+  var pt = dateStr.split('-');
+  var d = new Date(2026, MO_IDX[pt[1]] !== undefined ? MO_IDX[pt[1]] : 5, parseInt(pt[0]));
+  return DAY_NM[d.getDay()];
+}
+// Convenience wrappers for FX fixtures (which carry .d / .day / .est)
+function istDate(f) { return shiftDateStr(f.d, f.est); }
+function istDay(f)  { return dayNameForDate(istDate(f)); }
 function calLink(f) {
   try {
     var i=toIST(f.est);
-    var mo={Jun:'06',Jul:'07'};
-    var pt=f.d.split('-'), dy=parseInt(pt[0]);
-    if(i.next) dy++;
-    var m2=mo[pt[1]]||'06', d2=(dy<10?'0':'')+dy;
+    var d=istDateObj(f.d, f.est);
+    var m2=String(d.getMonth()+1).padStart(2,'0');
+    var d2=String(d.getDate()).padStart(2,'0');
     var hh=(i.h<10?'0':'')+i.h, mm=(i.m<10?'0':'')+i.m;
     var s2='2026'+m2+d2+'T'+hh+mm+'00';
     var eh2=(i.h+2)%24; var e2='2026'+m2+d2+'T'+(eh2<10?'0':'')+eh2+mm+'00';
@@ -877,11 +908,11 @@ function buildWA(f) {
   var r=STATE.matches[f.m], i=toIST(f.est);
   if (r && r.status==='FT') {
     return '⚽ *WC 2026 RESULT*\n'+f.f1+' *'+f.t1+' '+r.s1+'–'+r.s2+' '+f.t2+'* '+f.f2
-      +'\n📅 '+f.d+' · Group '+f.g+'\n📺 WC 2026 India Fan Guide 🇮🇳';
+      +'\n📅 '+istDate(f)+' · Group '+f.g+'\n📺 WC 2026 India Fan Guide 🇮🇳';
   }
   return '⚽ *WC 2026 MATCH*\n'+f.f1+' *'+f.t1+'* vs '+f.f2+' *'+f.t2+'*\n'
     +(isPrime(f.est)?'🟢':'⏰')+' *'+i.t+(i.next?' +1':'')+' IST*\n'
-    +'📅 '+f.day+', '+f.d+' · Group '+f.g+'\n📍 '+f.v+', '+f.c
+    +'📅 '+istDay(f)+', '+istDate(f)+' · Group '+f.g+'\n📍 '+f.v+', '+f.c
     +'\n📺 Unite8 Sports / ZEE5 🇮🇳';
 }
 function showToast(msg) {
@@ -1176,7 +1207,7 @@ function matchCard(f) {
   return `
   <div class="mc${isLive?' live':''}" style="border-left-color:${prime?'var(--green)':gc};">
     <div class="mc-meta">
-      <span class="mc-grp" style="color:${gc};">GROUP ${f.g} · ${f.d}</span>
+      <span class="mc-grp" style="color:${gc};">GROUP ${f.g} · ${istDate(f)}</span>
       ${statusBadge}
     </div>
     <div class="mc-body">
@@ -1201,10 +1232,11 @@ function copyWA(mid) {
 ══════════════════════════════════════════════════════ */
 function renderHome() {
   var wrap=document.getElementById('homeWrap'); if(!wrap)return;
-  var today=todayStr();
+  var today=todayStr(); // today's date in IST
   var played=FX.filter(function(f){ var r=getR(f.m); return r&&(r.status==='FT'||r.status==='FINISHED'); });
   var live  =FX.filter(function(f){ var r=getR(f.m); return r&&(r.status==='LIVE'||r.status==='HT'); });
-  var todayF=FX.filter(function(f){ return f.d===today; });
+  // Compare using IST date (istDate) not EDT date (f.d)
+  var todayF  =FX.filter(function(f){ return istDate(f)===today; });
   var upcoming=FX.filter(function(f){ var r=getR(f.m); return !r||r.status==='NS'; });
   var html='';
 
@@ -1224,8 +1256,9 @@ function renderHome() {
     showToday.forEach(function(f){ html+=matchCard(f); });
     html+=`</div><div class="divider"></div>`;
   } else if(!live.length && upcoming.length) {
-    var nd=upcoming[0].d;
-    var nf=upcoming.filter(function(f){ return f.d===nd; });
+    // Show next match day using IST date
+    var nd=istDate(upcoming[0]);
+    var nf=upcoming.filter(function(f){ return istDate(f)===nd; });
     html+=`<div class="hsec"><div class="hsec-hd">
       <span class="hsec-title">🗓 Coming Up · ${nd}</span>
       <span class="see-all" onclick="goPage('fixtures')">All →</span></div>`;
@@ -1306,16 +1339,18 @@ function applyFilters() {
 function renderFixtures() {
   var list=document.getElementById('fixList'); if(!list)return;
   list.innerHTML=''; var curDay='';
+  // Count matches per IST date (not EDT date)
   var dc={};
-  FX.forEach(function(f){ dc[f.d]=(dc[f.d]||0)+1; });
+  FX.forEach(function(f){ var id=istDate(f); dc[id]=(dc[id]||0)+1; });
   FX.forEach(function(f) {
-    if(f.d!==curDay) {
-      curDay=f.d;
+    var isoDay=istDate(f), isoDayName=istDay(f); // use IST date for display
+    if(isoDay!==curDay) {
+      curDay=isoDay;
       var dh=document.createElement('div');
-      dh.className='day-hd'; dh.dataset.day=f.d;
+      dh.className='day-hd'; dh.dataset.day=isoDay;
       dh.innerHTML=`<div class="day-line"></div>
-        <span class="day-txt">${f.day}, ${f.d} 2026</span>
-        <span class="day-cnt">${dc[f.d]} match${dc[f.d]>1?'es':''}</span>
+        <span class="day-txt">${isoDayName}, ${isoDay} 2026</span>
+        <span class="day-cnt">${dc[isoDay]} match${dc[isoDay]>1?'es':''}</span>
         <div class="day-line"></div>`;
       list.appendChild(dh);
     }
@@ -1326,7 +1361,7 @@ function renderFixtures() {
     var card=document.createElement('div');
     card.className='fc'+(prime?' prime':'')+(isFT?' played':'');
     card.dataset.grp=f.g; card.dataset.t1=f.t1.toLowerCase();
-    card.dataset.t2=f.t2.toLowerCase(); card.dataset.day=f.d;
+    card.dataset.t2=f.t2.toLowerCase(); card.dataset.day=isoDay; // IST date
     card.dataset.prime=prime?'1':'0';
     card.style.borderLeftColor=prime?'var(--green)':gc;
 
@@ -1363,8 +1398,8 @@ function copyAllWA() {
   var txt='⚽ *WC 2026 SCHEDULE*\n🇮🇳 All times IST · 📺 Unite8 Sports/ZEE5\n━━━━━━━━━━━━━━━━━━\n';
   var cd='';
   shown.forEach(function(f){
-    var r=getR(f.m), i=toIST(f.est);
-    if(f.d!==cd){ cd=f.d; txt+='\n*📅 '+f.day+', '+f.d+'*\n'; }
+    var r=getR(f.m), i=toIST(f.est), id=istDate(f), idn=istDay(f);
+    if(id!==cd){ cd=id; txt+='\n*📅 '+idn+', '+id+'*\n'; }
     if(r&&r.status==='FT') txt+='✅ *'+f.f1+' '+f.t1+' '+r.s1+'–'+r.s2+' '+f.t2+' '+f.f2+'* (FT)\n';
     else txt+=(isPrime(f.est)?'🟢':'⏰')+' *'+f.f1+' '+f.t1+' vs '+f.f2+' '+f.t2+'*\n   '+i.t+(i.next?' +1':'')+' IST · Grp '+f.g+'\n';
   });
@@ -1459,31 +1494,36 @@ function renderKnockout() {
       </div><div class="ko-body">`;
     rnd.m.forEach(function(m){
       var i=toIST(m.est);
+      var istD=shiftDateStr(m.date, m.est);
+      var istDN=dayNameForDate(istD);
       html+=`<div class="ko-row">
         <div class="ko-num" style="background:${rnd.c};">${m.n}</div>
         <div class="ko-info">
           <div class="ko-t">${m.t}</div>
-          <div class="ko-m">📅 ${m.date} · 📍 ${m.v}, ${m.city}</div>
+          <div class="ko-m">📅 ${istDN}, ${istD} · 📍 ${m.v}, ${m.city}</div>
         </div>
         <div class="ko-right">
           <div class="ko-ist">${i.t}</div>
-          ${i.next?`<div class="ko-nd">+1 day</div>`:''}
+          <div class="ko-nd" style="color:var(--muted);">IST</div>
         </div>
       </div>`;
     });
     html+=`</div></div>`;
   });
   var fi=toIST('15:00');
+  var fiD=shiftDateStr('19-Jul','15:00');
+  var fiDN=dayNameForDate(fiD);
   html+=`<div class="final-card">
     <div class="ft-ico">🏆</div>
     <div class="ft-h">THE FINAL</div>
     <div style="font-size:13px;color:rgba(255,255,255,.4);margin:5px 0;font-family:'Barlow Condensed',sans-serif;font-weight:600;">Winner SF1 vs Winner SF2</div>
     <div class="ft-chips">
-      <span class="ft-chip">📅 Sun 19 Jul 2026</span>
+      <span class="ft-chip">📅 ${fiDN} ${fiD} 2026 (IST)</span>
       <span class="ft-chip">⏰ ${fi.t} IST</span>
       <span class="ft-chip">🏟 MetLife Stadium, NY/NJ</span>
       <span class="ft-chip">👥 82,500</span>
     </div>
+    <div style="font-size:9px;color:var(--muted);margin-top:6px;">Local kickoff: Sun 19 Jul, 3:00 PM EDT</div>
   </div>`;
   wrap.innerHTML=html;
 }

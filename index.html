@@ -441,6 +441,12 @@ body{background:var(--bg);color:var(--text);
   color:#000;border:none;border-radius:8px;padding:11px;
   font-weight:800;cursor:pointer;
   font-family:'Barlow Condensed',sans-serif;font-size:14px;letter-spacing:1px;}
+.md-timeline{display:flex;flex-direction:column;gap:7px;max-height:220px;overflow-y:auto;}
+.md-goal{display:grid;grid-template-columns:1fr 34px 1fr;align-items:center;gap:6px;}
+.md-goal-l{font-size:11px;text-align:right;color:var(--text);}
+.md-goal-r{font-size:11px;text-align:left;color:var(--text);}
+.md-goal-min{font-size:10px;font-weight:800;color:var(--gold);text-align:center;
+  background:rgba(255,215,0,.1);border-radius:8px;padding:2px 0;}
 </style>
 </head>
 <body>
@@ -616,6 +622,7 @@ var STATE = {
   timer: null,
   apiDiag: null,      // {total, matched, samples} — for India tab diagnostics
   cdnDiag: null,      // {total, withScore, matched} — for India tab diagnostics
+  cacheAge: null,      // ms since last successful localStorage cache was saved
   keyPersisted: null  // null=unknown, true=saved to localStorage, false=session-only
 };
 
@@ -1194,13 +1201,19 @@ var LiveEngine = {
       }
     }
 
-    /* ── TIER 3: baked-in results (always works) ── */
+    /* ── TIER 3: local cache or baked-in results (always works, even offline) ── */
     if (!ok) {
-      STATE.source = 'baked';
+      var hasCache = STATE.cacheAge != null;
+      STATE.source = hasCache ? 'cache' : 'baked';
       if (dot) dot.style.background = 'var(--muted2)';
-      if (txt) txt.textContent = CFG.apiKey
-        ? '⚠️ Network unavailable · Showing cached results · Will retry'
-        : '⚙️ Go to India tab → enter your free API key to enable live scores';
+      if (hasCache) {
+        var ageMin = Math.round(STATE.cacheAge/60000);
+        if (txt) txt.textContent = '📦 Offline/network issue · Showing last saved data (' + (ageMin<1?'just now':ageMin+'m old') + ')';
+      } else if (txt) {
+        txt.textContent = CFG.apiKey
+          ? '⚠️ Network unavailable · Showing baked-in results · Will retry'
+          : '⚙️ Go to India tab → enter your free API key to enable live scores';
+      }
     }
 
     STATE.lastFetch = new Date();
@@ -1210,8 +1223,39 @@ var LiveEngine = {
     if (tim) tim.textContent = 'Updated ' + dh2 + ':' + (mi2<10?'0':'') + mi2 + ' ' + ap2 + ' IST';
     if (ico) ico.className = '';
 
+    // Persist whatever we just learned so the NEXT app open shows real data
+    // instantly (before any network call completes), instead of a blank
+    // slate or only baked results — important on patchy mobile data.
+    if (ok) LiveEngine.saveCache();
+
     LiveEngine.updateUI();
     LiveEngine.schedule();
+  },
+
+  /* ── Local cache: survives closing the tab / patchy network on reopen ── */
+  saveCache: function() {
+    try {
+      localStorage.setItem('wc26_cache_matches', JSON.stringify(STATE.matches));
+      localStorage.setItem('wc26_cache_source', STATE.source);
+      localStorage.setItem('wc26_cache_ts', String(Date.now()));
+    } catch(e) { /* storage full or blocked — silently skip, not critical */ }
+  },
+  loadCache: function() {
+    try {
+      var raw = localStorage.getItem('wc26_cache_matches');
+      var ts = localStorage.getItem('wc26_cache_ts');
+      if (!raw || !ts) return false;
+      var parsed = JSON.parse(raw);
+      // Merge cached results UNDER baked data — baked is a known-correct
+      // floor, cache only fills in anything baked doesn't already have or
+      // upgrades it (e.g. a FT result baked data doesn't know about yet).
+      Object.keys(parsed).forEach(function(k){
+        STATE.matches[parseInt(k)] = parsed[k];
+      });
+      STATE.cacheAge = Date.now() - parseInt(ts);
+      STATE.source = 'cache';
+      return true;
+    } catch(e) { return false; }
   },
 
   updateUI: function() {
@@ -1272,7 +1316,12 @@ var LiveEngine = {
     STATE.timer = setTimeout(function(){ LiveEngine.refresh(false); }, ms);
   },
 
-  start: function() { LiveEngine.loadBaked(); LiveEngine.refresh(false); }
+  start: function() {
+    LiveEngine.loadBaked();      // known-correct floor, always works offline
+    var hadCache = LiveEngine.loadCache(); // instantly overlay last-known live data
+    if (hadCache) LiveEngine.updateUI();   // render immediately, don't wait for network
+    LiveEngine.refresh(false);             // then try to get fresher data
+  }
 };
 
 /* ══════════════════════════════════════════════════════
@@ -1368,6 +1417,78 @@ function copyWA(mid) {
   navigator.clipboard.writeText(buildWA(f))
     .then(function(){ showToast('✅ Copied for WhatsApp!'); })
     .catch(function(){ showToast('Copy failed — try again'); });
+}
+
+/* ══════════════════════════════════════════════════════
+   MATCH DETAIL MODAL — tap a played/live fixture to see
+   the goal-by-goal timeline (scorer + minute), not just
+   the final score. Goal data comes from football-data.org
+   when connected; falls back gracefully when unavailable
+   (CDN/baked sources only carry the final score, no scorers).
+══════════════════════════════════════════════════════ */
+function showMatchDetail(mid) {
+  var f = FX.find(function(x){ return x.m===mid; }); if(!f) return;
+  var r = getR(mid); if(!r) return;
+  var isLive = r.status==='LIVE'||r.status==='HT';
+  var isHT = r.status==='HT';
+
+  var statusLine = isHT ? 'Half Time'
+    : isLive ? ('🔴 LIVE' + (r.minute?(' · '+r.minute+"'"):''))
+    : 'Full Time';
+  var statusColor = isLive ? 'var(--red)' : 'var(--green)';
+
+  // Split + order goals chronologically, tag each to home/away side
+  var goalsHTML = '';
+  if (r.goals && r.goals.length) {
+    var tagged = r.goals.map(function(g){
+      var side = resolveTeam(g.t)===f.t1 ? 1 : (resolveTeam(g.t)===f.t2 ? 2 : 0);
+      return {n:g.n, m:g.m||0, side:side};
+    }).sort(function(a,b){ return a.m-b.m; });
+    goalsHTML = `<div class="md-timeline">` + tagged.map(function(g){
+      var leftSide = g.side===1;
+      var rightSide = g.side===2;
+      return `<div class="md-goal">
+        <span class="md-goal-l">${leftSide ? '⚽ '+g.n : ''}</span>
+        <span class="md-goal-min">${g.m}'</span>
+        <span class="md-goal-r">${rightSide ? g.n+' ⚽' : ''}</span>
+      </div>`;
+    }).join('') + `</div>`;
+  } else if (r.s1>0 || r.s2>0) {
+    goalsHTML = `<div style="text-align:center;font-size:11px;color:var(--muted);padding:14px 0;line-height:1.6;">
+      Goal scorer details aren't available for this match<br>
+      <span style="font-size:9px;">(only shown when connected via football-data.org's live API)</span>
+    </div>`;
+  } else {
+    goalsHTML = `<div style="text-align:center;font-size:12px;color:var(--muted);padding:14px 0;">No goals in this match.</div>`;
+  }
+
+  var m = document.createElement('div');
+  m.className = 'modal-bg';
+  m.innerHTML = `<div class="modal-box" style="max-width:380px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <span style="font-size:9px;font-weight:700;letter-spacing:1px;color:${GC[f.g]||'var(--gold)'};">GROUP ${f.g} · ${istDate(f)}</span>
+      <span style="font-size:9px;font-weight:800;color:${statusColor};">${statusLine}</span>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0 14px;">
+      <div style="flex:1;text-align:center;">
+        <div style="font-size:28px;">${f.f1}</div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;margin-top:4px;">${f.t1}</div>
+      </div>
+      <div style="font-family:'Bebas Neue',cursive;font-size:34px;color:var(--gold);padding:0 14px;white-space:nowrap;">${r.s1}–${r.s2}</div>
+      <div style="flex:1;text-align:center;">
+        <div style="font-size:28px;">${f.f2}</div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;margin-top:4px;">${f.t2}</div>
+      </div>
+    </div>
+    <div style="border-top:1px solid var(--b2);padding-top:10px;">
+      <div style="font-size:9px;font-weight:700;letter-spacing:1px;color:var(--muted);margin-bottom:6px;">⚽ GOAL TIMELINE</div>
+      ${goalsHTML}
+    </div>
+    <div style="font-size:10px;color:var(--muted);text-align:center;margin-top:10px;">📍 ${f.v}, ${f.c}</div>
+    <button class="modal-close" onclick="this.closest('.modal-bg').remove()">CLOSE ✕</button>
+  </div>`;
+  m.addEventListener('click', function(e){ if(e.target===m) m.remove(); });
+  document.body.appendChild(m);
 }
 
 /* ══════════════════════════════════════════════════════
@@ -1513,6 +1634,13 @@ function renderFixtures() {
     else if(isLive) midH=`<div class="fc-sc lsc">${r.s1}–${r.s2}</div><div class="ldot" style="margin:3px auto 0;"></div>`;
     else midH=`<div class="fc-vs">VS</div><div style="font-size:8px;background:${gc}20;color:${gc};padding:2px 5px;border-radius:6px;font-weight:700;">GRP ${f.g}</div>`;
 
+    // Played/live matches open a tap-to-expand detail (goal scorers, timeline).
+    var tappable = isFT || isLive;
+    if (tappable) {
+      card.style.cursor='pointer';
+      card.onclick = function(){ showMatchDetail(f.m); };
+    }
+
     card.innerHTML=`
       <div class="fc-top">
         <div class="fct"><div class="fct-flag">${f.f1}</div><div class="fct-name">${f.t1}</div></div>
@@ -1521,11 +1649,12 @@ function renderFixtures() {
       </div>
       <div class="fc-bot">
         <div class="fc-ist">⏰ ${i.t}${i.next?`<span style="font-size:9px;color:var(--gold2);"> +1</span>`:''}${prime?`<span style="background:rgba(34,197,94,.15);color:var(--green);font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;margin-left:5px;">🟢</span>`:''}
+          ${tappable?`<span style="font-size:9px;color:var(--muted);margin-left:6px;">· tap for details</span>`:''}
         </div>
         <div class="fc-chips">
           <span class="chip">📍 ${f.v}</span>
-          <a class="btn-cal" href="${calLink(f)}" target="_blank" style="padding:3px 8px;font-size:9px;">📅</a>
-          <button class="btn-wa" onclick="copyWA(${f.m})" style="padding:3px 8px;font-size:9px;">💬</button>
+          <a class="btn-cal" href="${calLink(f)}" target="_blank" onclick="event.stopPropagation()" style="padding:3px 8px;font-size:9px;">📅</a>
+          <button class="btn-wa" onclick="event.stopPropagation();copyWA(${f.m})" style="padding:3px 8px;font-size:9px;">💬</button>
         </div>
       </div>`;
     list.appendChild(card);
@@ -1989,7 +2118,8 @@ function buildDiagnostics() {
     api:       '✅ football-data.org (live)',
     'api-proxy':'✅ football-data.org (via CORS proxy)',
     cdn:       '📡 openfootball CDN (daily)',
-    baked:     '📦 Cached / baked-in data'
+    cache:     '📦 Local cache (offline/network issue)',
+    baked:     '📦 Baked-in data only'
   }[STATE.source] || STATE.source;
 
   var lastFetchTxt = '—';
@@ -2058,6 +2188,10 @@ function buildDiagnostics() {
       <span style="font-size:11px;color:var(--muted);">Live matches right now</span>
       <span style="font-size:12px;font-weight:700;color:${liveCount>0?'var(--red)':'var(--muted)'};">${liveCount>0 ? '🔴 '+liveCount+' LIVE' : 'None'}</span>
     </div>
+    ${STATE.source==='cache' && STATE.cacheAge!=null ? `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--b2);">
+      <span style="font-size:11px;color:var(--muted);">Local cache (this device)</span>
+      <span style="font-size:12px;font-weight:700;color:var(--gold);">Saved ${Math.round(STATE.cacheAge/60000)<1?'just now':Math.round(STATE.cacheAge/60000)+'m ago'}</span>
+    </div>` : ''}
     ${apiRows}
     ${cdnRows}
     <div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6;">

@@ -464,7 +464,7 @@ body{background:var(--bg);color:var(--text);
 </div>
 
 <!-- ── PAGES ── -->
-<div id="page-home" class="page active">
+<div id="page-matches" class="page active">
   <div class="hero">
     <div class="hero-eye">⚽ Official Fan Guide · IST Edition 🇮🇳</div>
     <div class="hero-h1">FIFA WORLD CUP</div>
@@ -477,25 +477,16 @@ body{background:var(--bg);color:var(--text);
       <div class="hs"><span class="hs-n">16</span><span class="hs-l">Venues</span></div>
     </div>
   </div>
-  <div class="md-banner">
-    <div style="display:flex;align-items:center;gap:8px;">
-      <div class="livepill"><span class="ldot"></span>TOURNAMENT LIVE</div>
-      <span id="mdLabel" style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;color:var(--text);"></span>
-    </div>
-    <div style="display:flex;gap:5px;">
-      <button class="mdbtn" onclick="goPage('live')">📊 Standings</button>
-      <button class="mdbtn" onclick="goPage('fixtures')">📅 All Fixtures</button>
-    </div>
-  </div>
   <div class="ist-info">🇮🇳 <strong style="color:var(--gold)">All times IST</strong> &nbsp;(IST = US Eastern EDT + 9 hrs 30 min) &nbsp;·&nbsp; 🟢 Green = Prime Time 6–11 PM IST</div>
-  <div id="homeWrap"></div>
-</div>
 
-<div id="page-fixtures" class="page">
-  <div class="sec-head">
-    <div class="sec-title">📅 Group Stage Fixtures</div>
-    <div class="sec-sub">11 Jun – 29 Jun 2026 · 72 Matches · All times IST</div>
+  <div id="topZone"></div>
+
+  <div style="display:flex;align-items:center;gap:8px;margin:6px 14px 12px;">
+    <div style="flex:1;height:0.5px;background:var(--b2);"></div>
+    <span style="font-size:10px;color:var(--muted);letter-spacing:1px;">ALL MATCHES</span>
+    <div style="flex:1;height:0.5px;background:var(--b2);"></div>
   </div>
+
   <div class="filter-bar">
     <div class="srch-wrap">
       <span class="srch-ico">🔍</span>
@@ -587,8 +578,7 @@ body{background:var(--bg);color:var(--text);
 
 <!-- ── BOTTOM NAV ── -->
 <nav class="bnav">
-  <button class="bn active" onclick="goPage('home')"><span class="bn-ico">🏠</span>Home</button>
-  <button class="bn" onclick="goPage('fixtures')"><span class="bn-ico">📅</span>Fixtures</button>
+  <button class="bn active" onclick="goPage('matches')"><span class="bn-ico">⚽</span>Matches</button>
   <button class="bn" onclick="goPage('live')"><span class="bn-ico">📊</span>Standings<span class="bn-badge" id="liveBadge">●</span></button>
   <button class="bn" onclick="goPage('knockout')"><span class="bn-ico">⚡</span>Knockout</button>
   <button class="bn" onclick="goPage('guide')"><span class="bn-ico">📖</span>Guide</button>
@@ -1272,7 +1262,7 @@ var LiveEngine = {
       if (STATE.hasLive) {
         pill.style.display = 'flex';
         if (pillTxt) pillTxt.textContent = liveMatches.length + ' LIVE';
-        pill.onclick = function(){ goPage('home'); };
+        pill.onclick = function(){ goPage('matches'); };
         pill.style.cursor = 'pointer';
       } else {
         pill.style.display = 'none';
@@ -1281,8 +1271,7 @@ var LiveEngine = {
     var cp = document.querySelector('.page.active');
     if (cp) {
       var pid = cp.id.replace('page-','');
-      if (pid==='home') renderHome();
-      else if (pid==='fixtures') renderFixtures();
+      if (pid==='matches') { renderMatchesTop(); renderFixtures(); }
       else if (pid==='live') renderStandings();
       // India tab is intentionally NOT auto-re-rendered here — re-rendering
       // mid-refresh would wipe out an API key the user is currently typing.
@@ -1351,7 +1340,10 @@ function goPage(name) {
     b.classList.toggle('active', (b.getAttribute('onclick')||'').indexOf(name)!==-1);
   });
   window.scrollTo(0,0);
-  if(name==='live')renderStandings();
+  // Always re-render on navigation so each tab reflects the latest known
+  // match data, regardless of when it last updated in the background.
+  if(name==='matches'){ renderMatchesTop(); renderFixtures(); }
+  else if(name==='live')renderStandings();
   else if(name==='india')renderIndia();
 }
 
@@ -1392,12 +1384,13 @@ function matchCard(f) {
   }
 
   var footHTML = isFT
-    ? `<button class="btn-wa" onclick="copyWA(${f.m})" style="flex:1;text-align:center;">💬 Share Result</button>`
-    : `<a class="btn-cal" href="${calLink(f)}" target="_blank" style="flex:1;text-align:center;">📅 Calendar</a>
-       <button class="btn-wa" onclick="copyWA(${f.m})" style="flex:1;text-align:center;">💬 WhatsApp</button>`;
+    ? `<button class="btn-wa" onclick="event.stopPropagation();copyWA(${f.m})" style="flex:1;text-align:center;">💬 Share Result</button>`
+    : `<a class="btn-cal" href="${calLink(f)}" target="_blank" onclick="event.stopPropagation()" style="flex:1;text-align:center;">📅 Calendar</a>
+       <button class="btn-wa" onclick="event.stopPropagation();copyWA(${f.m})" style="flex:1;text-align:center;">💬 WhatsApp</button>`;
 
+  var tappable = isFT || isLive;
   return `
-  <div class="mc${isLive?' live':''}" style="border-left-color:${prime?'var(--green)':gc};">
+  <div class="mc${isLive?' live':''}" style="border-left-color:${prime?'var(--green)':gc};${tappable?'cursor:pointer;':''}" ${tappable?`onclick="showMatchDetail(${f.m})"`:''}>
     <div class="mc-meta">
       <span class="mc-grp" style="color:${gc};">GROUP ${f.g} · ${istDate(f)}</span>
       ${statusBadge}
@@ -1494,13 +1487,10 @@ function showMatchDetail(mid) {
 /* ══════════════════════════════════════════════════════
    HOME PAGE
 ══════════════════════════════════════════════════════ */
-function renderHome() {
-  var wrap=document.getElementById('homeWrap'); if(!wrap)return;
-  var today=todayStr(); // today's date in IST
+function renderMatchesTop() {
+  var wrap=document.getElementById('topZone'); if(!wrap)return;
   var played=FX.filter(function(f){ var r=getR(f.m); return r&&(r.status==='FT'||r.status==='FINISHED'); });
   var live  =FX.filter(function(f){ var r=getR(f.m); return r&&(r.status==='LIVE'||r.status==='HT'); });
-  // Compare using IST date (istDate) not EDT date (f.d)
-  var todayF  =FX.filter(function(f){ return istDate(f)===today; });
   var upcoming=FX.filter(function(f){ var r=getR(f.m); return !r||r.status==='NS'; });
   var html='';
 
@@ -1509,39 +1499,26 @@ function renderHome() {
       <span class="hsec-title" style="color:var(--red);">🔴 Live Now</span>
       <span class="see-all" onclick="goPage('live')">Standings →</span></div>`;
     live.forEach(function(f){ html+=matchCard(f); });
-    html+=`</div><div class="divider"></div>`;
-  }
-
-  var showToday = todayF.filter(function(f){ return !live.find(function(l){ return l.m===f.m; }); });
-  if(showToday.length) {
-    html+=`<div class="hsec"><div class="hsec-hd">
-      <span class="hsec-title">📅 Todays Matches · ${today}</span>
-      <span class="see-all" onclick="goPage('fixtures')">All →</span></div>`;
-    showToday.forEach(function(f){ html+=matchCard(f); });
-    html+=`</div><div class="divider"></div>`;
-  } else if(!live.length && upcoming.length) {
-    // Show next match day using IST date
-    var nd=istDate(upcoming[0]);
-    var nf=upcoming.filter(function(f){ return istDate(f)===nd; });
-    html+=`<div class="hsec"><div class="hsec-hd">
-      <span class="hsec-title">🗓 Coming Up · ${nd}</span>
-      <span class="see-all" onclick="goPage('fixtures')">All →</span></div>`;
-    nf.slice(0,4).forEach(function(f){ html+=matchCard(f); });
-    html+=`</div><div class="divider"></div>`;
-  }
-
-  if(played.length) {
-    html+=`<div class="hsec" style="padding-bottom:12px;"><div class="hsec-hd">
-      <span class="hsec-title">📊 Latest Results</span>
-      <span class="see-all" onclick="goPage('live')">Standings →</span></div>`;
-    played.slice(-5).reverse().forEach(function(f){ html+=matchCard(f); });
     html+=`</div>`;
   }
 
-  if(!html) html=`<div class="empty">
-    <div style="font-size:40px;margin-bottom:10px;">🏆</div>
-    <div style="font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:700;color:var(--gold);">WC 2026 Is Underway!</div>
-    <div style="font-size:12px;margin-top:6px;line-height:1.6;">Use the tabs below to explore fixtures and standings.</div></div>`;
+  if(played.length) {
+    html+=`<div class="hsec" style="padding-bottom:4px;"><div class="hsec-hd">
+      <span class="hsec-title">📊 Recent Results</span>
+      <span class="see-all" onclick="goPage('live')">Standings →</span></div>`;
+    played.slice(-3).reverse().forEach(function(f){ html+=matchCard(f); });
+    html+=`</div>`;
+  }
+
+  // Pre-tournament fallback — nothing live or played yet, show what's next
+  if(!live.length && !played.length && upcoming.length) {
+    var nd=istDate(upcoming[0]);
+    var nf=upcoming.filter(function(f){ return istDate(f)===nd; });
+    html+=`<div class="hsec" style="padding-bottom:4px;"><div class="hsec-hd">
+      <span class="hsec-title">🗓 Coming Up · ${nd}</span></div>`;
+    nf.slice(0,3).forEach(function(f){ html+=matchCard(f); });
+    html+=`</div>`;
+  }
 
   wrap.innerHTML=html;
 }
@@ -2311,7 +2288,6 @@ function scheduleReminders() {
 function init() {
   buildGrpPills();
   buildMTSel();
-  renderFixtures();
   renderKnockout();
   buildGuide('stars', document.getElementById('gStars'));
   document.getElementById('gStars').dataset.r='1';
@@ -2319,8 +2295,13 @@ function init() {
     var nb=document.getElementById('notifBtn');
     if(nb){ nb.textContent='🔔✅'; nb.classList.add('on'); }
   }
+  // IMPORTANT: LiveEngine.start() synchronously loads baked + cached match
+  // results into STATE.matches BEFORE any async network call. The Matches
+  // tab must render AFTER this, or every card renders with zero match
+  // data (blank "VS", no scores, no tap-to-detail) — this was a real bug.
   LiveEngine.start();
-  setTimeout(renderHome, 150);
+  renderFixtures();
+  renderMatchesTop();
   console.log('%c[WC2026 v4] Ready · IST=EDT+9h30m · Live Engine active', 'color:#FFD700;font-weight:bold;font-size:12px;');
 }
 document.addEventListener('DOMContentLoaded', init);

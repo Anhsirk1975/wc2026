@@ -531,7 +531,12 @@ body{background:var(--bg);color:var(--text);
     <div class="sl"><div class="sl-dot" style="background:var(--red)"></div>Eliminated</div>
     <div class="sl"><div class="sl-dot" style="background:var(--blue)"></div>Live Now</div>
   </div>
+  <div style="display:flex;gap:8px;margin:0 14px 12px;">
+    <button id="stdTabGroups" class="gpill on" style="flex:1;" onclick="setStdView('groups')">📊 Group Tables</button>
+    <button id="stdTabScorers" class="gpill" style="flex:1;" onclick="setStdView('scorers')">🏆 Top Scorers</button>
+  </div>
   <div class="std-wrap" id="stdOut"></div>
+  <div id="scorersOut" style="display:none;"></div>
 </div>
 
 <div id="page-knockout" class="page">
@@ -602,6 +607,34 @@ var CFG = {
 };
 try { CFG.apiKey = localStorage.getItem('wc26_apikey') || ''; } catch(e) {}
 
+try {
+  var _predRaw = localStorage.getItem('wc26_predictions');
+  if (_predRaw) STATE.predictions = JSON.parse(_predRaw);
+} catch(e) {}
+function savePrediction(mid, s1, s2) {
+  STATE.predictions[mid] = {s1:s1, s2:s2};
+  try { localStorage.setItem('wc26_predictions', JSON.stringify(STATE.predictions)); } catch(e) {}
+}
+function getPrediction(mid) { return STATE.predictions[mid] || null; }
+// Scoring: exact scoreline = 3 pts, correct winner/draw = 1 pt, wrong = 0
+function predictionPoints(pred, actual) {
+  if (!pred || !actual) return null;
+  if (pred.s1===actual.s1 && pred.s2===actual.s2) return 3;
+  var predOutcome = pred.s1>pred.s2?'H':(pred.s1<pred.s2?'A':'D');
+  var actOutcome  = actual.s1>actual.s2?'H':(actual.s1<actual.s2?'A':'D');
+  return predOutcome===actOutcome ? 1 : 0;
+}
+function totalPredictionPoints() {
+  var total=0, scored=0;
+  Object.keys(STATE.predictions).forEach(function(mid){
+    var r=getR(parseInt(mid));
+    if (!r || (r.status!=='FT'&&r.status!=='FINISHED')) return;
+    var pts=predictionPoints(STATE.predictions[mid], r);
+    if (pts!==null) { total+=pts; scored++; }
+  });
+  return {total:total, scored:scored};
+}
+
 var STATE = {
   matches: {},
   source: 'baked',
@@ -613,7 +646,14 @@ var STATE = {
   apiDiag: null,      // {total, matched, samples} — for India tab diagnostics
   cdnDiag: null,      // {total, withScore, matched} — for India tab diagnostics
   cacheAge: null,      // ms since last successful localStorage cache was saved
-  keyPersisted: null  // null=unknown, true=saved to localStorage, false=session-only
+  keyPersisted: null, // null=unknown, true=saved to localStorage, false=session-only
+  scorers: [],         // Top Scorers leaderboard (football-data.org /scorers)
+  scorersFetchedAt: null,
+  crests: {},           // team name -> crest image URL (football-data.org /teams)
+  crestsFetchedAt: null,
+  officialStd: null,    // official FIFA standings (football-data.org /standings), for cross-check
+  officialStdFetchedAt: null,
+  predictions: {}       // matchId -> {s1, s2} — user's score predictions
 };
 
 /* ── GROUP COLOURS ── */
@@ -1017,6 +1057,29 @@ function findFixtureByTeams(ourHome, ourAway) {
       || FX.find(function(f){ return f.t1===ourAway && f.t2===ourHome; }) || null;
 }
 
+// Team name -> flag emoji lookup, built once from GROUPS (used by Top Scorers).
+var TEAM_FLAG = {};
+(function buildFlagMap(){
+  Object.keys(GROUPS).forEach(function(g){
+    GROUPS[g].t.forEach(function(t){ TEAM_FLAG[t[1]] = t[0]; });
+  });
+})();
+
+/* teamIcon(name, fallbackEmoji, px)
+   Returns a real crest <img> when we have one cached (from football-data.org
+   /teams), otherwise falls back to the emoji flag already baked into FX/
+   GROUPS. Crests are optional polish — if the fetch never succeeds (no key,
+   offline, etc.) every part of the app keeps working exactly as before with
+   emoji flags, since this function never throws and always returns *something*. */
+function teamIcon(name, fallbackEmoji, px) {
+  px = px || 18;
+  var url = STATE.crests && STATE.crests[name];
+  if (url) {
+    return `<img src="${url}" alt="${name}" style="width:${px}px;height:${px}px;object-fit:contain;vertical-align:middle;" onerror="this.outerHTML='${(fallbackEmoji||'🏳️').replace(/'/g,"\\'")}';">`;
+  }
+  return fallbackEmoji || '🏳️';
+}
+
 /* ══════════════════════════════════════════════════════
    LIVE DATA ENGINE
 ══════════════════════════════════════════════════════ */
@@ -1111,6 +1174,87 @@ var LiveEngine = {
     });
     STATE.cdnDiag = {total: total, withScore: (data.matches||[]).filter(function(m){return m.score&&m.score.ft;}).length, matched: n, ts: new Date()};
     return n;
+  },
+
+  /* ── Top Scorers (football-data.org /scorers — free tier) ──────────
+     Same direct+CORS-proxy fallback pattern as fetchAPI. Re-fetched on
+     a slower cadence than match scores (goal leaderboards don't need
+     second-by-second updates) to conserve the free tier's rate limit. */
+  fetchScorers: async function(viaProxy) {
+    if (!CFG.apiKey) throw new Error('No key');
+    var url = CFG.apiBase+'/competitions/'+CFG.comp+'/scorers?season='+CFG.season+'&limit=20';
+    var target = viaProxy ? ('https://corsproxy.io/?url='+encodeURIComponent(url)) : url;
+    var r = await fetch(target, { headers: {'X-Auth-Token': CFG.apiKey} });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    return (await r.json()).scorers || [];
+  },
+  parseScorers: function(list) {
+    STATE.scorers = list.map(function(s){
+      var p = s.player||{}, t = s.team||{};
+      return {
+        name: p.name || 'Unknown',
+        nat: p.nationality || '',
+        team: resolveTeam(t.name) || resolveTeam(t.shortName) || t.name || '',
+        goals: s.goals||0,
+        assists: s.assists||0,
+        penalties: s.penalties||0
+      };
+    }).sort(function(a,b){ return b.goals-a.goals || b.assists-a.assists; });
+    STATE.scorersFetchedAt = Date.now();
+    return STATE.scorers.length;
+  },
+
+  /* ── Team Crests (football-data.org /teams — free tier) ──────────────
+     Real crest images instead of emoji flags. Fetched once and cached
+     for a long time (crests don't change during a tournament). Always
+     optional — teamIcon() falls back to emoji if this never succeeds. */
+  fetchCrests: async function(viaProxy) {
+    if (!CFG.apiKey) throw new Error('No key');
+    var url = CFG.apiBase+'/competitions/'+CFG.comp+'/teams?season='+CFG.season;
+    var target = viaProxy ? ('https://corsproxy.io/?url='+encodeURIComponent(url)) : url;
+    var r = await fetch(target, { headers: {'X-Auth-Token': CFG.apiKey} });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    return (await r.json()).teams || [];
+  },
+  parseCrests: function(list) {
+    var n=0;
+    list.forEach(function(t){
+      if (!t.crest) return;
+      var ours = resolveTeam(t.name) || resolveTeam(t.shortName) || resolveTeam(t.tla);
+      if (ours) { STATE.crests[ours] = t.crest; n++; }
+    });
+    STATE.crestsFetchedAt = Date.now();
+    return n;
+  },
+
+  /* ── Official FIFA Standings (football-data.org /standings) ──────────
+     Cross-check against our own computeStd() math — purely a trust
+     signal, never replaces our own (faster, always-available) calc. */
+  fetchStandings: async function(viaProxy) {
+    if (!CFG.apiKey) throw new Error('No key');
+    var url = CFG.apiBase+'/competitions/'+CFG.comp+'/standings?season='+CFG.season;
+    var target = viaProxy ? ('https://corsproxy.io/?url='+encodeURIComponent(url)) : url;
+    var r = await fetch(target, { headers: {'X-Auth-Token': CFG.apiKey} });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    return (await r.json()).standings || [];
+  },
+  parseStandings: function(list) {
+    // Build { A: ['Mexico','South Korea','Czechia','South Africa'], ... }
+    // ranked order per the official table, keyed by our canonical team names.
+    var out = {};
+    list.forEach(function(grp){
+      var gname = grp.group || ''; // e.g. "GROUP_A"
+      var m = gname.match(/GROUP_([A-L])/);
+      if (!m) return;
+      var letter = m[1];
+      out[letter] = (grp.table||[]).map(function(row){
+        var t = row.team||{};
+        return resolveTeam(t.name) || resolveTeam(t.shortName) || resolveTeam(t.tla) || t.name;
+      });
+    });
+    STATE.officialStd = out;
+    STATE.officialStdFetchedAt = Date.now();
+    return Object.keys(out).length;
   },
 
   refresh: async function(manual) {
@@ -1218,6 +1362,38 @@ var LiveEngine = {
     // slate or only baked results — important on patchy mobile data.
     if (ok) LiveEngine.saveCache();
 
+    // Top Scorers — fetched separately on a slower cadence (5 min) to
+    // conserve the free-tier rate limit; doesn't block match-score flow.
+    var scorersStale = !STATE.scorersFetchedAt || (Date.now() - STATE.scorersFetchedAt) > 300000;
+    if (CFG.apiKey && scorersStale) {
+      try { LiveEngine.parseScorers(await LiveEngine.fetchScorers(false)); LiveEngine.saveCache(); }
+      catch(eS) {
+        try { LiveEngine.parseScorers(await LiveEngine.fetchScorers(true)); LiveEngine.saveCache(); }
+        catch(eS2) { /* scorers are supplementary — fail silently, last-known list stays visible */ }
+      }
+    }
+
+    // Team Crests — fetched once and barely re-checked (crests never
+    // change mid-tournament). 1-hour throttle keeps this to ~1 call total.
+    var crestsStale = !STATE.crestsFetchedAt || (Date.now() - STATE.crestsFetchedAt) > 3600000;
+    if (CFG.apiKey && crestsStale) {
+      try { LiveEngine.parseCrests(await LiveEngine.fetchCrests(false)); LiveEngine.saveCache(); }
+      catch(eC) {
+        try { LiveEngine.parseCrests(await LiveEngine.fetchCrests(true)); LiveEngine.saveCache(); }
+        catch(eC2) { /* crests are purely cosmetic — emoji fallback covers this */ }
+      }
+    }
+
+    // Official FIFA Standings cross-check — same 5-min cadence as scorers.
+    var stdStale = !STATE.officialStdFetchedAt || (Date.now() - STATE.officialStdFetchedAt) > 300000;
+    if (CFG.apiKey && stdStale) {
+      try { LiveEngine.parseStandings(await LiveEngine.fetchStandings(false)); }
+      catch(eO) {
+        try { LiveEngine.parseStandings(await LiveEngine.fetchStandings(true)); }
+        catch(eO2) { /* cross-check is supplementary — our own calc always still works */ }
+      }
+    }
+
     LiveEngine.updateUI();
     LiveEngine.schedule();
   },
@@ -1228,6 +1404,12 @@ var LiveEngine = {
       localStorage.setItem('wc26_cache_matches', JSON.stringify(STATE.matches));
       localStorage.setItem('wc26_cache_source', STATE.source);
       localStorage.setItem('wc26_cache_ts', String(Date.now()));
+      if (STATE.scorers && STATE.scorers.length) {
+        localStorage.setItem('wc26_cache_scorers', JSON.stringify(STATE.scorers));
+      }
+      if (STATE.crests && Object.keys(STATE.crests).length) {
+        localStorage.setItem('wc26_cache_crests', JSON.stringify(STATE.crests));
+      }
     } catch(e) { /* storage full or blocked — silently skip, not critical */ }
   },
   loadCache: function() {
@@ -1244,6 +1426,14 @@ var LiveEngine = {
       });
       STATE.cacheAge = Date.now() - parseInt(ts);
       STATE.source = 'cache';
+      try {
+        var scRaw = localStorage.getItem('wc26_cache_scorers');
+        if (scRaw) STATE.scorers = JSON.parse(scRaw);
+      } catch(eSc) { /* scorers cache optional, ignore failures */ }
+      try {
+        var crRaw = localStorage.getItem('wc26_cache_crests');
+        if (crRaw) STATE.crests = JSON.parse(crRaw);
+      } catch(eCr) { /* crests cache optional, ignore failures */ }
       return true;
     } catch(e) { return false; }
   },
@@ -1272,7 +1462,7 @@ var LiveEngine = {
     if (cp) {
       var pid = cp.id.replace('page-','');
       if (pid==='matches') { renderMatchesTop(); renderFixtures(); }
-      else if (pid==='live') renderStandings();
+      else if (pid==='live') { renderStandings(); if (stdView==='scorers') renderScorers(); }
       // India tab is intentionally NOT auto-re-rendered here — re-rendering
       // mid-refresh would wipe out an API key the user is currently typing.
       // It re-renders fresh every time the tab is opened (goPage -> renderIndia).
@@ -1388,19 +1578,22 @@ function matchCard(f) {
     : `<a class="btn-cal" href="${calLink(f)}" target="_blank" onclick="event.stopPropagation()" style="flex:1;text-align:center;">📅 Calendar</a>
        <button class="btn-wa" onclick="event.stopPropagation();copyWA(${f.m})" style="flex:1;text-align:center;">💬 WhatsApp</button>`;
 
-  var tappable = isFT || isLive;
+  var tappable = isFT || isLive || !r || r.status==='NS';
+  var tapHandler = (isFT||isLive) ? `showMatchDetail(${f.m})` : `showPredictionModal(${f.m})`;
+  var predBadge = predictionBadge(f, isFT);
   return `
-  <div class="mc${isLive?' live':''}" style="border-left-color:${prime?'var(--green)':gc};${tappable?'cursor:pointer;':''}" ${tappable?`onclick="showMatchDetail(${f.m})"`:''}>
+  <div class="mc${isLive?' live':''}" style="border-left-color:${prime?'var(--green)':gc};${tappable?'cursor:pointer;':''}" ${tappable?`onclick="${tapHandler}"`:''}>
     <div class="mc-meta">
       <span class="mc-grp" style="color:${gc};">GROUP ${f.g} · ${istDate(f)}</span>
       ${statusBadge}
     </div>
     <div class="mc-body">
-      <div class="mc-team"><span class="mc-flag">${f.f1}</span><span class="mc-name">${f.t1}</span></div>
+      <div class="mc-team"><span class="mc-flag">${teamIcon(f.t1,f.f1,20)}</span><span class="mc-name">${f.t1}</span></div>
       <div class="mc-center">${centerHTML}</div>
-      <div class="mc-team r"><span class="mc-flag">${f.f2}</span><span class="mc-name">${f.t2}</span></div>
+      <div class="mc-team r"><span class="mc-flag">${teamIcon(f.t2,f.f2,20)}</span><span class="mc-name">${f.t2}</span></div>
     </div>
     ${goalsHTML}
+    ${predBadge}
     <div class="mc-foot" style="display:flex;gap:6px;padding:8px 13px 11px;">${footHTML}</div>
   </div>`;
 }
@@ -1464,12 +1657,12 @@ function showMatchDetail(mid) {
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0 14px;">
       <div style="flex:1;text-align:center;">
-        <div style="font-size:28px;">${f.f1}</div>
+        <div style="font-size:28px;">${teamIcon(f.t1,f.f1,40)}</div>
         <div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;margin-top:4px;">${f.t1}</div>
       </div>
       <div style="font-family:'Bebas Neue',cursive;font-size:34px;color:var(--gold);padding:0 14px;white-space:nowrap;">${r.s1}–${r.s2}</div>
       <div style="flex:1;text-align:center;">
-        <div style="font-size:28px;">${f.f2}</div>
+        <div style="font-size:28px;">${teamIcon(f.t2,f.f2,40)}</div>
         <div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;font-weight:700;margin-top:4px;">${f.t2}</div>
       </div>
     </div>
@@ -1482,6 +1675,65 @@ function showMatchDetail(mid) {
   </div>`;
   m.addEventListener('click', function(e){ if(e.target===m) m.remove(); });
   document.body.appendChild(m);
+}
+
+/* ══════════════════════════════════════════════════════
+   PREDICT THE SCORELINE — tap an upcoming (not-yet-started)
+   match to guess the result. Exact score = 3pts, correct
+   winner/draw = 1pt, wrong = 0. Purely local — no backend,
+   no leaderboard with other users, just a personal score
+   tracker across the tournament for fun + WhatsApp bragging.
+══════════════════════════════════════════════════════ */
+function showPredictionModal(mid) {
+  var f = FX.find(function(x){ return x.m===mid; }); if(!f) return;
+  var existing = getPrediction(mid);
+  var m = document.createElement('div');
+  m.className = 'modal-bg';
+  m.innerHTML = `<div class="modal-box" style="max-width:340px;">
+    <div class="modal-title">🎯 PREDICT THE SCORE</div>
+    <div style="font-size:11px;color:var(--muted);text-align:center;margin-bottom:14px;">${istDate(f)} · Group ${f.g}</div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:18px;">
+      <div style="text-align:center;flex:1;">
+        <div style="font-size:26px;margin-bottom:6px;">${teamIcon(f.t1,f.f1,32)}</div>
+        <div style="font-size:11px;font-weight:700;margin-bottom:8px;">${f.t1}</div>
+        <input type="number" id="predS1" min="0" max="20" value="${existing?existing.s1:0}"
+          style="width:50px;text-align:center;font-size:20px;padding:6px;border-radius:8px;border:1px solid var(--b2);background:var(--bg3);color:var(--text);">
+      </div>
+      <div style="font-size:18px;color:var(--muted);margin-top:38px;">–</div>
+      <div style="text-align:center;flex:1;">
+        <div style="font-size:26px;margin-bottom:6px;">${teamIcon(f.t2,f.f2,32)}</div>
+        <div style="font-size:11px;font-weight:700;margin-bottom:8px;">${f.t2}</div>
+        <input type="number" id="predS2" min="0" max="20" value="${existing?existing.s2:0}"
+          style="width:50px;text-align:center;font-size:20px;padding:6px;border-radius:8px;border:1px solid var(--b2);background:var(--bg3);color:var(--text);">
+      </div>
+    </div>
+    <button class="btn-gold" onclick="confirmPrediction(${mid})">💾 Save Prediction</button>
+    <button class="modal-close" onclick="this.closest('.modal-bg').remove()">CLOSE ✕</button>
+  </div>`;
+  m.addEventListener('click', function(e){ if(e.target===m) m.remove(); });
+  document.body.appendChild(m);
+}
+function confirmPrediction(mid) {
+  var s1in=document.getElementById('predS1'), s2in=document.getElementById('predS2');
+  if (!s1in || !s2in) return;
+  var s1=Math.max(0,parseInt(s1in.value)||0), s2=Math.max(0,parseInt(s2in.value)||0);
+  savePrediction(mid, s1, s2);
+  var mb=document.querySelector('.modal-bg'); if(mb) mb.remove();
+  showToast('🎯 Prediction saved!');
+  var cp=document.querySelector('.page.active');
+  if (cp && cp.id==='page-matches') { renderMatchesTop(); renderFixtures(); }
+}
+// Small badge shown on a card: your pick (before kickoff) or points earned (after FT)
+function predictionBadge(f, isFT) {
+  var pred=getPrediction(f.m); if(!pred) return '';
+  if (isFT) {
+    var r=getR(f.m);
+    var pts=predictionPoints(pred, r);
+    var label = pts===3?'🎯 Exact! +3':pts===1?'🎯 Right result +1':'🎯 Missed';
+    var color = pts>0?'var(--green)':'var(--muted)';
+    return `<div style="font-size:9px;font-weight:700;color:${color};margin-top:3px;">${label} (picked ${pred.s1}–${pred.s2})</div>`;
+  }
+  return `<div style="font-size:9px;color:var(--gold2);margin-top:3px;">🎯 Your pick: ${pred.s1}–${pred.s2}</div>`;
 }
 
 /* ══════════════════════════════════════════════════════
@@ -1518,6 +1770,18 @@ function renderMatchesTop() {
       <span class="hsec-title">🗓 Coming Up · ${nd}</span></div>`;
     nf.slice(0,3).forEach(function(f){ html+=matchCard(f); });
     html+=`</div>`;
+  }
+
+  // My Predictions summary — only shows once the user has made at least one pick
+  var predCount=Object.keys(STATE.predictions).length;
+  if (predCount>0) {
+    var pp=totalPredictionPoints();
+    html+=`<div class="hsec" style="padding-bottom:4px;"><div class="hsec-hd">
+      <span class="hsec-title">🎯 My Predictions</span></div>
+      <div style="margin:0 14px 10px;padding:10px 14px;border-radius:10px;background:rgba(255,215,0,.07);border:1px solid rgba(255,215,0,.18);display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:12px;color:var(--muted);">${predCount} pick${predCount>1?'s':''} made · ${pp.scored} scored so far</span>
+        <span style="font-family:'Bebas Neue',cursive;font-size:22px;color:var(--gold);">${pp.total} pts</span>
+      </div></div>`;
   }
 
   wrap.innerHTML=html;
@@ -1611,22 +1875,24 @@ function renderFixtures() {
     else if(isLive) midH=`<div class="fc-sc lsc">${r.s1}–${r.s2}</div><div class="ldot" style="margin:3px auto 0;"></div>`;
     else midH=`<div class="fc-vs">VS</div><div style="font-size:8px;background:${gc}20;color:${gc};padding:2px 5px;border-radius:6px;font-weight:700;">GRP ${f.g}</div>`;
 
-    // Played/live matches open a tap-to-expand detail (goal scorers, timeline).
-    var tappable = isFT || isLive;
-    if (tappable) {
-      card.style.cursor='pointer';
-      card.onclick = function(){ showMatchDetail(f.m); };
-    }
+    // Played/live matches open the goal-detail popup; upcoming matches
+    // open the score-prediction popup instead — every card is tappable.
+    var tappable = true;
+    var detailTap = isFT || isLive;
+    card.style.cursor='pointer';
+    card.onclick = function(){ if (detailTap) showMatchDetail(f.m); else showPredictionModal(f.m); };
 
+    var predBadge = predictionBadge(f, isFT);
     card.innerHTML=`
       <div class="fc-top">
-        <div class="fct"><div class="fct-flag">${f.f1}</div><div class="fct-name">${f.t1}</div></div>
+        <div class="fct"><div class="fct-flag">${teamIcon(f.t1,f.f1,22)}</div><div class="fct-name">${f.t1}</div></div>
         <div class="fc-mid">${midH}</div>
-        <div class="fct r"><div class="fct-flag">${f.f2}</div><div class="fct-name">${f.t2}</div></div>
+        <div class="fct r"><div class="fct-flag">${teamIcon(f.t2,f.f2,22)}</div><div class="fct-name">${f.t2}</div></div>
       </div>
+      ${predBadge ? `<div style="text-align:center;">${predBadge}</div>` : ''}
       <div class="fc-bot">
         <div class="fc-ist">⏰ ${i.t}${i.next?`<span style="font-size:9px;color:var(--gold2);"> +1</span>`:''}${prime?`<span style="background:rgba(34,197,94,.15);color:var(--green);font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;margin-left:5px;">🟢</span>`:''}
-          ${tappable?`<span style="font-size:9px;color:var(--muted);margin-left:6px;">· tap for details</span>`:''}
+          <span style="font-size:9px;color:var(--muted);margin-left:6px;">· tap ${detailTap?'for details':'to predict'}</span>
         </div>
         <div class="fc-chips">
           <span class="chip">📍 ${f.v}</span>
@@ -1682,9 +1948,65 @@ function computeStd() {
   });
   return tbl;
 }
+
+/* ── Qualification status — makes the existing legend (Qualified/
+   Contention/Eliminated) actually true, not a rough guess ──────────────
+   Certain outcomes (don't need other groups to finish):
+     • Top 2 in a completed group  -> always qualifies
+     • 4th in a completed group    -> always eliminated
+   Uncertain until ALL 12 groups finish:
+     • 3rd place — only the best 8 of 12 third-placed teams advance,
+       so a single group finishing first tells us nothing on its own. */
+function computeThirdPlaceQualifiers(std) {
+  var allComplete = Object.keys(std).every(function(g){
+    return std[g].every(function(t){ return t.p===3; });
+  });
+  if (!allComplete) return null;
+  var thirds = Object.keys(std).map(function(g){
+    var row = std[g][2];
+    return {grp:g, nm:row.nm, pts:row.pts, gf:row.gf, ga:row.ga};
+  });
+  thirds.sort(function(a,b){ return b.pts-a.pts || (b.gf-b.ga)-(a.gf-a.ga) || b.gf-a.gf; });
+  var qualified = {};
+  thirds.slice(0,8).forEach(function(t){ qualified[t.grp+'|'+t.nm] = true; });
+  return qualified;
+}
+function getQualStatus(g, i, t, thirdQualifiers) {
+  if (t.p < 3) return null; // group not finished yet for this team — too early to call
+  if (i < 2) return {label:'Qualified', color:'var(--green)'};
+  if (i === 3) return {label:'Eliminated', color:'var(--red)'};
+  // i === 2 -> third place, depends on the other 11 groups
+  if (thirdQualifiers === null) return {label:'In contention', color:'var(--gold)'};
+  return thirdQualifiers[g+'|'+t.nm]
+    ? {label:'Qualified (3rd)', color:'var(--green)'}
+    : {label:'Eliminated', color:'var(--red)'};
+}
+
+function compareToOfficial(std) {
+  if (!STATE.officialStd || !Object.keys(STATE.officialStd).length) return null;
+  var groups=Object.keys(GROUPS), mismatches=[];
+  groups.forEach(function(g){
+    var off=STATE.officialStd[g];
+    if (!off || !off.length) return;
+    var ours=std[g].map(function(t){ return t.nm; });
+    var same=off.every(function(nm,idx){ return ours[idx]===nm; });
+    if (!same) mismatches.push(g);
+  });
+  return {checkedCount: groups.filter(function(g){return STATE.officialStd[g];}).length, mismatches: mismatches};
+}
+
 function renderStandings() {
   var out=document.getElementById('stdOut'); if(!out)return;
   var std=computeStd(); var html='';
+  var thirdQ=computeThirdPlaceQualifiers(std); // null until all 12 groups finish
+  var cmp=compareToOfficial(std);
+  if (cmp && cmp.checkedCount>0) {
+    if (cmp.mismatches.length===0) {
+      html+=`<div style="margin:0 14px 10px;padding:7px 12px;border-radius:8px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);font-size:10px;color:var(--green);">✓ Matches official FIFA standings (${cmp.checkedCount}/12 groups checked)</div>`;
+    } else {
+      html+=`<div style="margin:0 14px 10px;padding:7px 12px;border-radius:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);font-size:10px;color:var(--amber);">⚠ Differs slightly from official FIFA standings in Group ${cmp.mismatches.join(', ')} — likely a tie-break rule (head-to-head/fair-play) we don't model. Our W/D/L/Pts are still accurate.</div>`;
+    }
+  }
   Object.keys(GROUPS).forEach(function(g){
     var gc=GC[g]||'#FFD700', rows=std[g]||[];
     html+=`<div class="grp-blk">
@@ -1696,13 +2018,15 @@ function renderStandings() {
         <th>#</th><th>Team</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GD</th>
         <th style="color:${gc};">Pts</th></tr></thead><tbody>`;
     rows.forEach(function(t,i){
-      var qc=t.live?'var(--blue)':(i<2&&t.p>0?'var(--green)':(i===3&&t.p>=3?'var(--red)':'transparent'));
-      var bg=t.live?'background:rgba(59,130,246,.07);':(i<2&&t.p>0?'background:rgba(34,197,94,.06);':'');
+      var qs=getQualStatus(g,i,t,thirdQ);
+      var qc=t.live?'var(--blue)':(qs?qs.color:'transparent');
+      var bg=t.live?'background:rgba(59,130,246,.07);':(qs&&qs.color==='var(--green)'?'background:rgba(34,197,94,.06);':(qs&&qs.color==='var(--red)'?'background:rgba(239,68,68,.04);':''));
       var gd=t.p>0?(t.gf-t.ga>=0?'+':'')+(t.gf-t.ga):'–';
       var dash='<span style="color:var(--muted2)">–</span>';
       html+=`<tr style="${bg}">
-        <td><span class="qdot" style="background:${qc};"></span>${i+1}</td>
-        <td><div class="stc"><span style="font-size:16px;">${t.fl}</span><span>${t.nm.split(' ')[0]}</span></div></td>
+        <td><span class="qdot" style="background:${qc};" title="${qs?qs.label:''}"></span>${i+1}</td>
+        <td><div class="stc"><span style="font-size:16px;">${teamIcon(t.nm,t.fl,18)}</span><span>${t.nm.split(' ')[0]}</span></div>
+          ${qs?`<div style="font-size:8px;font-weight:700;color:${qs.color};margin-left:21px;">${qs.label}</div>`:''}</td>
         <td>${t.p||dash}</td><td>${t.p?t.w:dash}</td><td>${t.p?t.d:dash}</td><td>${t.p?t.l:dash}</td>
         <td>${t.p?gd:dash}</td>
         <td><span class="pts-num" style="color:${gc};">${t.p?t.pts:dash}</span></td></tr>`;
@@ -1727,6 +2051,59 @@ function renderStandings() {
     html+=`</div>`;
   });
   out.innerHTML=html;
+}
+
+/* ── Standings page view toggle: Group Tables vs Top Scorers ── */
+var stdView = 'groups';
+function setStdView(v) {
+  stdView = v;
+  var tabGrp=document.getElementById('stdTabGroups'), tabSc=document.getElementById('stdTabScorers');
+  var outGrp=document.getElementById('stdOut'), outSc=document.getElementById('scorersOut');
+  if (tabGrp) tabGrp.classList.toggle('on', v==='groups');
+  if (tabSc) tabSc.classList.toggle('on', v==='scorers');
+  if (outGrp) outGrp.style.display = v==='groups' ? '' : 'none';
+  if (outSc) { outSc.style.display = v==='scorers' ? '' : 'none'; if (v==='scorers') renderScorers(); }
+}
+
+function renderScorers() {
+  var out=document.getElementById('scorersOut'); if(!out)return;
+
+  if (!CFG.apiKey) {
+    out.innerHTML = `<div class="setup-box" style="margin:0 14px;">
+      <div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:800;color:var(--gold);margin-bottom:4px;">🔑 Top Scorers needs your free API key</div>
+      <div style="font-size:11px;color:var(--muted);line-height:1.7;">Add your football-data.org key on the <strong style="color:var(--text);">India</strong> tab to unlock the live Golden Boot leaderboard.</div>
+    </div>`;
+    return;
+  }
+  if (!STATE.scorers || !STATE.scorers.length) {
+    out.innerHTML = `<div class="empty" style="margin:0 14px;">
+      <div style="font-size:32px;margin-bottom:8px;">⚽</div>
+      <div style="font-size:12px;color:var(--muted);line-height:1.6;">No scorer data yet — check back once group-stage goals start rolling in.</div>
+    </div>`;
+    return;
+  }
+
+  var rows = STATE.scorers.slice(0, 15).map(function(s, i){
+    var fl = teamIcon(s.team, TEAM_FLAG[s.team]||'🏳️', 17);
+    var medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':(i+1);
+    return `<tr>
+      <td style="text-align:center;font-weight:700;color:${i<3?'var(--gold)':'var(--muted)'};">${medal}</td>
+      <td><div class="stc"><span style="font-size:15px;">${fl}</span><span>${s.name}</span></div>
+          <div style="font-size:9px;color:var(--muted);margin-left:21px;">${s.team}</div></td>
+      <td style="text-align:center;font-weight:800;color:var(--gold);font-size:14px;">${s.goals}</td>
+      <td style="text-align:center;color:var(--muted);font-size:11px;">${s.assists||0}</td>
+    </tr>`;
+  }).join('');
+
+  out.innerHTML = `<div class="grp-blk" style="margin:0 14px;">
+    <div class="grp-hd" style="background:rgba(255,215,0,.1);border:1px solid rgba(255,215,0,.2);">
+      <span class="grp-hd-name" style="color:var(--gold);">🏆 GOLDEN BOOT RACE</span>
+    </div>
+    <table class="std-tbl"><thead><tr>
+      <th>#</th><th>Player</th><th>⚽</th><th>🅰️</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <div style="font-size:9px;color:var(--muted);padding:8px 4px 2px;">Updates roughly every 5 minutes during the tournament · football-data.org</div>
+  </div>`;
 }
 
 /* ══════════════════════════════════════════════════════
